@@ -1,0 +1,142 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// Konfigurasi WiFi & MQTT Broker (Sesuaikan saat Technical Meeting / Lomba)
+const char* ssid = "NAMA_WIFI_PANITIA";
+const char* password = "PASSWORD_WIFI";
+const char* mqtt_server = "192.168.1.100"; // IP Broker Panitia / URL Broker
+const int mqtt_port = 1883;                // Port standar MQTT non-TLS (8883 untuk MQTTS)
+const char* client_id = "IONIC_TIM_01";
+
+// Topik MQTT
+const char* topic_pub = "ionic/tim01/telemetry";
+const char* topic_sub = "ionic/tim01/control";
+const char* topic_lwt = "ionic/tim01/status";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Timer Non-Blocking
+unsigned long previousMillisMQTT = 0;
+const unsigned long intervalMQTT = 5000; // Kirim data tiap 5 detik (5000 ms)
+
+unsigned long previousReconnectMillis = 0;
+const unsigned long reconnectInterval = 5000;
+
+// Variabel contoh status aktuator & sensor
+bool relayState = false;
+String systemStatus = "NORMAL"; // NORMAL, WARNING, CRITICAL
+
+void setupWiFi() {
+  Serial.print("Menghubungkan ke WiFi: ");
+  Serial.println(ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Terhubung! IP: " + WiFi.localIP().toString());
+}
+
+// Callback: Menangani pesan JSON yang masuk dari Broker (Subscriber)
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Pesan masuk di topik [");
+  Serial.print(topic);
+  Serial.println("]");
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+
+  if (error) {
+    Serial.print("Parsing JSON Gagal (INVALID_PAYLOAD): ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  // Contoh membaca perintah dari JSON: {"relay": true, "target_angle": 90}
+  if (doc.containsKey("relay")) {
+    relayState = doc["relay"].as<bool>();
+    Serial.print("Status Relay diubah ke: ");
+    Serial.println(relayState ? "ON" : "OFF");
+  }
+}
+
+// Reconnect MQTT secara Non-Blocking agar tidak mengganggu sensor
+void reconnectMQTT() {
+  if (!client.connected()) {
+    unsigned long now = millis();
+    if (now - previousReconnectMillis >= reconnectInterval) {
+      previousReconnectMillis = now;
+      Serial.print("Menghubungkan ke MQTT Broker...");
+      
+      // Connect dengan LWT (QoS 1, Retain true, Pesan: DEVICE_OFFLINE)
+      if (client.connect(client_id, NULL, NULL, topic_lwt, 1, true, "{\"status\":\"DEVICE_OFFLINE\"}")) {
+        Serial.println("Terhubung!");
+        // Publikasi status online dengan Retain Flag = true
+        client.publish(topic_lwt, "{\"status\":\"ONLINE\"}", true);
+        // Subscribe ke topik kontrol
+        client.subscribe(topic_sub);
+      } else {
+        Serial.print("Gagal, rc=");
+        Serial.println(client.state());
+      }
+    }
+  }
+}
+
+// Fungsi Mengirim Payload JSON ke Broker (Publisher)
+void sendDataToCloud(float temp, float hum, float voltage) {
+  JsonDocument doc;
+
+  // Mengisi Key-Value Pair sesuai standar JSON (tanpa komentar)
+  doc["device_id"] = client_id;
+  doc["timestamp"] = millis();
+  doc["temperature"] = serialized(String(temp, 2)); // 2 angka di belakang koma
+  doc["humidity"] = serialized(String(hum, 2));
+  doc["voltage"] = serialized(String(voltage, 2));
+  doc["relay_state"] = relayState;
+  doc["system_status"] = systemStatus;
+
+  // Contoh jika diminta Array di dalam JSON
+  JsonArray sensors = doc["active_sensors"].to<JsonArray>();
+  sensors.add("DHT");
+  sensors.add("ADC");
+
+  char jsonBuffer[512];
+  serializeJson(doc, jsonBuffer);
+
+  // Publish ke broker
+  if (client.publish(topic_pub, jsonBuffer)) {
+    Serial.print("JSON Terkirim: ");
+    Serial.println(jsonBuffer);
+  } else {
+    Serial.println("Gagal mengirim JSON (Periksa ukuran buffer/koneksi)");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  setupWiFi();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+  client.setBufferSize(512); // Perbesar buffer untuk payload JSON
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    setupWiFi();
+  }
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop(); // Wajib dipanggil terus-menerus untuk menjaga Keep-Alive MQTT
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillisMQTT >= intervalMQTT) {
+    previousMillisMQTT = currentMillis;
+    // Contoh pemanggilan fungsi kirim data dengan nilai dummy
+    sendDataToCloud(28.5, 65.2, 3.15);
+  }
+}
